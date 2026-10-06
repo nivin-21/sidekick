@@ -2,24 +2,18 @@
 Ingestion pipeline: loads knowledge base markdown files, chunks them,
 embeds with sentence-transformers, and stores in ChromaDB.
 Run with: python -m src.ingest
+
+The collection is rebuilt from scratch on every run, so edited or deleted
+documents never leave stale chunks behind.
 """
 
 from __future__ import annotations
 
-import os
-import re
-from pathlib import Path
-
 import chromadb
-from chromadb.config import Settings
 from sentence_transformers import SentenceTransformer
 
-KNOWLEDGE_BASE_DIR = Path(__file__).parent.parent / "knowledge_base"
-CHROMA_PERSIST_PATH = os.getenv("CHROMA_PERSIST_PATH", "./chroma_db")
-EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "all-MiniLM-L6-v2")
-COLLECTION_NAME = "be_guru"
-CHUNK_SIZE = 500
-CHUNK_OVERLAP = 50
+from src.chunking import Chunk, chunk_document
+from src.config import CHROMA_PERSIST_PATH, COLLECTION_NAME, EMBEDDING_MODEL, KNOWLEDGE_BASE_DIR
 
 
 def load_documents() -> list[dict]:
@@ -32,113 +26,53 @@ def load_documents() -> list[dict]:
     return docs
 
 
-def chunk_document(content: str, source: str) -> list[dict]:
-    """
-    Chunk a document preserving paragraph boundaries.
-    Splits on double newlines first, then merges small paragraphs
-    and splits large ones to stay near CHUNK_SIZE.
-    """
-    paragraphs = re.split(r"\n\n+", content.strip())
-    chunks = []
-    current_chunk = ""
-    chunk_index = 0
+def embed_and_store(chunks: list[Chunk], model: SentenceTransformer, collection: chromadb.Collection) -> None:
+    """Embed all chunks in one batch and add them to ChromaDB."""
+    texts = [c.content for c in chunks]
+    embeddings = model.encode(texts, show_progress_bar=False, batch_size=64).tolist()
 
-    for para in paragraphs:
-        para = para.strip()
-        if not para:
-            continue
-
-        if len(current_chunk) + len(para) + 2 <= CHUNK_SIZE:
-            current_chunk = (current_chunk + "\n\n" + para).strip()
-        else:
-            if current_chunk:
-                chunks.append({
-                    "content": current_chunk,
-                    "source": source,
-                    "chunk_index": chunk_index,
-                })
-                chunk_index += 1
-                overlap_text = current_chunk[-CHUNK_OVERLAP:] if len(current_chunk) > CHUNK_OVERLAP else current_chunk
-                candidate = (overlap_text + "\n\n" + para).strip()
-                # If overlap + para still exceeds limit, split it by character
-                if len(candidate) > CHUNK_SIZE:
-                    for i in range(0, len(candidate), CHUNK_SIZE - CHUNK_OVERLAP):
-                        sub = candidate[i:i + CHUNK_SIZE]
-                        chunks.append({
-                            "content": sub,
-                            "source": source,
-                            "chunk_index": chunk_index,
-                        })
-                        chunk_index += 1
-                    current_chunk = ""
-                else:
-                    current_chunk = candidate
-            else:
-                # Paragraph itself is larger than CHUNK_SIZE — split by chars
-                for i in range(0, len(para), CHUNK_SIZE - CHUNK_OVERLAP):
-                    sub = para[i:i + CHUNK_SIZE]
-                    chunks.append({
-                        "content": sub,
-                        "source": source,
-                        "chunk_index": chunk_index,
-                    })
-                    chunk_index += 1
-                current_chunk = ""
-
-    if current_chunk:
-        chunks.append({
-            "content": current_chunk,
-            "source": source,
-            "chunk_index": chunk_index,
-        })
-
-    return chunks
-
-
-def embed_and_store(chunks: list[dict], model: SentenceTransformer, collection: chromadb.Collection) -> None:
-    """Embed chunks and upsert into ChromaDB."""
-    texts = [c["content"] for c in chunks]
-    embeddings = model.encode(texts, show_progress_bar=False).tolist()
-
-    ids = [f"{c['source']}__chunk_{c['chunk_index']}" for c in chunks]
-    metadatas = [{"source": c["source"], "chunk_index": c["chunk_index"]} for c in chunks]
-
-    collection.upsert(
-        ids=ids,
+    collection.add(
+        ids=[f"{c.source}__chunk_{c.chunk_index}" for c in chunks],
         documents=texts,
         embeddings=embeddings,
-        metadatas=metadatas,
+        metadatas=[
+            {"source": c.source, "section": c.section, "chunk_index": c.chunk_index}
+            for c in chunks
+        ],
     )
 
 
 def main() -> None:
-    print("=== BE Guru — Ingestion Pipeline ===\n")
+    print("=== Sidekick — Ingestion Pipeline ===\n")
 
-    print(f"Loading embedding model: {EMBEDDING_MODEL}")
+    print("Loading knowledge base documents:")
+    docs = load_documents()
+    if not docs:
+        print(f"ERROR: No markdown files found in {KNOWLEDGE_BASE_DIR}")
+        return
+
+    chunks: list[Chunk] = []
+    for doc in docs:
+        doc_chunks = chunk_document(doc["content"], doc["source"])
+        chunks.extend(doc_chunks)
+        print(f"  Chunked: {doc['source']} → {len(doc_chunks)} chunks")
+
+    print(f"\nLoading embedding model: {EMBEDDING_MODEL}")
     model = SentenceTransformer(EMBEDDING_MODEL)
 
-    print(f"\nConnecting to ChromaDB at: {CHROMA_PERSIST_PATH}")
+    print(f"\nRebuilding collection '{COLLECTION_NAME}' at: {CHROMA_PERSIST_PATH}")
     client = chromadb.PersistentClient(path=CHROMA_PERSIST_PATH)
-    collection = client.get_or_create_collection(
+    try:
+        client.delete_collection(COLLECTION_NAME)
+    except Exception:
+        pass  # collection did not exist yet
+    collection = client.create_collection(
         name=COLLECTION_NAME,
         metadata={"hnsw:space": "cosine"},
     )
 
-    print("\nLoading knowledge base documents:")
-    docs = load_documents()
-    if not docs:
-        print("ERROR: No markdown files found in knowledge_base/")
-        return
-
-    total_chunks = 0
-    for doc in docs:
-        chunks = chunk_document(doc["content"], doc["source"])
-        embed_and_store(chunks, model, collection)
-        total_chunks += len(chunks)
-        print(f"  Indexed: {doc['source']} → {len(chunks)} chunks")
-
-    print(f"\nDone. Total chunks stored: {total_chunks}")
-    print(f"Collection '{COLLECTION_NAME}' has {collection.count()} documents.")
+    embed_and_store(chunks, model, collection)
+    print(f"\nDone. Collection '{COLLECTION_NAME}' has {collection.count()} chunks from {len(docs)} documents.")
 
 
 if __name__ == "__main__":
